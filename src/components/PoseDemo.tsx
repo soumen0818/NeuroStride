@@ -28,6 +28,10 @@ export default function PoseDemo({ mode }: PoseDemoProps) {
     const isTrackingRef = useRef<boolean>(false);
     const isPausedRef = useRef<boolean>(false);
 
+    // Smoothing buffer to reduce fluctuation
+    const angleBufferRef = useRef<number[]>([]);
+    const metricsBufferRef = useRef<any[]>([]);
+
     useEffect(() => {
         async function initializeTensorFlow() {
             try {
@@ -62,6 +66,23 @@ export default function PoseDemo({ mode }: PoseDemoProps) {
         };
     }, []);
 
+    // Smoothing function to reduce fluctuations
+    const smoothAngle = (currentAngle: number | null): number | null => {
+        if (currentAngle == null) return null;
+
+        // Add to buffer
+        angleBufferRef.current.push(currentAngle);
+
+        // Keep only last 5 frames for smoothing
+        if (angleBufferRef.current.length > 5) {
+            angleBufferRef.current.shift();
+        }
+
+        // Return moving average
+        const sum = angleBufferRef.current.reduce((a, b) => a + b, 0);
+        return sum / angleBufferRef.current.length;
+    };
+
     // Continuous loop - shows video and tracks when enabled
     const continuousLoop = async () => {
         const video = videoRef.current;
@@ -91,27 +112,37 @@ export default function PoseDemo({ mode }: PoseDemoProps) {
 
             if (pose) {
                 const m = computeMetrics(pose, mode);
+
+                // Apply smoothing to reduce fluctuations
+                if (m.kneeAngleAvg != null) {
+                    m.kneeAngleAvg = smoothAngle(m.kneeAngleAvg);
+                }
+
                 setMetrics(m);
 
-                // Rep counting logic
+                // Rep counting logic with more lenient thresholds
                 if (mode === "squat" && m.kneeAngleAvg != null) {
                     const currentAngle = m.kneeAngleAvg;
                     const prevAngle = lastKneeAngleRef.current;
 
                     if (prevAngle != null) {
-                        // Going down (angle decreasing)
-                        if (repStateRef.current === "up" && currentAngle < 100 && prevAngle > currentAngle) {
+                        // Going down (angle decreasing) - detect downward movement
+                        if (repStateRef.current === "up" && currentAngle < 105) {
                             repStateRef.current = "down";
+                            console.log("🔽 Going DOWN - Angle:", currentAngle);
                         }
-                        // Coming up (angle increasing)
-                        if (repStateRef.current === "down" && currentAngle > 120 && currentAngle > prevAngle) {
+                        // Coming up (angle increasing) - detect upward movement and count rep
+                        if (repStateRef.current === "down" && currentAngle > 130) {
                             repStateRef.current = "up";
+                            console.log("🔼 Coming UP - Rep completed! Angle:", currentAngle);
 
                             // Use functional updates to avoid stale closure issues
                             setRepCount(prev => prev + 1);
 
-                            // Check if it was a good rep
-                            const wasGoodForm = !m.hasKneeValgus && m.depthLabel !== "Shallow";
+                            // Check if it was a good rep - more lenient criteria
+                            const wasGoodForm = !m.hasKneeValgus && (m.depthLabel === "Moderate" || m.depthLabel === "Deep");
+                            console.log("✅ Good Form?", wasGoodForm, "- Depth:", m.depthLabel, "- Knee Valgus:", m.hasKneeValgus);
+
                             if (wasGoodForm) {
                                 setGoodReps(prev => prev + 1);
                             }
@@ -271,6 +302,11 @@ export default function PoseDemo({ mode }: PoseDemoProps) {
         setSessionStats({ total: 0, good: 0, warnings: 0 });
         repStateRef.current = "up";
         lastKneeAngleRef.current = null;
+
+        // Clear smoothing buffers
+        angleBufferRef.current = [];
+        metricsBufferRef.current = [];
+
         setStatus("Ready - Click Start");
     };
 
@@ -679,14 +715,14 @@ function computeMetrics(
     const rightAnkleKp = kp("right_ankle");
 
     if (leftHipKp && leftKneeKp && leftAnkleKp && rightHipKp && rightKneeKp && rightAnkleKp) {
-        // Check if knees are too close together relative to hips
+        // Check if knees are too close together relative to hips - LESS SENSITIVE
         const hipWidth = Math.abs(leftHipKp.x - rightHipKp.x);
         const kneeWidth = Math.abs(leftKneeKp.x - rightKneeKp.x);
         const ankleWidth = Math.abs(leftAnkleKp.x - rightAnkleKp.x);
 
-        // Knee valgus: knees closer together than they should be
+        // Knee valgus: knees closer together than they should be - More lenient thresholds
         const kneeHipRatio = kneeWidth / hipWidth;
-        if (kneeHipRatio < 0.7 || kneeWidth < ankleWidth * 0.8) {
+        if (kneeHipRatio < 0.5 || kneeWidth < ankleWidth * 0.65) {
             hasKneeValgus = true;
         }
     }
@@ -721,12 +757,14 @@ function computeMetrics(
         if (hasKneeValgus) {
             cue = "⚠️ Keep knees outward!";
         } else if (kneeAngleAvg != null) {
-            if (kneeAngleAvg > 130) cue = "Go deeper";
-            else if (kneeAngleAvg < 70) cue = "Maintain neutral spine";
+            // More lenient depth classification
+            if (kneeAngleAvg > 140) cue = "Go deeper";
+            else if (kneeAngleAvg < 60) cue = "Don't go too deep";
             else cue = "Great form! 💪";
 
+            // More realistic depth thresholds - easier to get "Moderate"
             if (kneeAngleAvg < 80) depthLabel = "Deep";
-            else if (kneeAngleAvg < 120) depthLabel = "Moderate";
+            else if (kneeAngleAvg < 135) depthLabel = "Moderate";  // Wider range for moderate
             else depthLabel = "Shallow";
         }
 
